@@ -1,0 +1,11 @@
+{
+  "name": "nodeapp",
+  "version": "1.0.0",
+  "description": "Sample Node.js app for Azure App Service",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "",
+  "license": "ISC"
+}
