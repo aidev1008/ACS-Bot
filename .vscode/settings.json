@@ -1,0 +1,4 @@
+{
+    "appService.defaultWebAppToDeploy": "/subscriptions/6808d285-32c8-4532-9ee3-14094195c3ef/resourceGroups/nodeapp-rg/providers/Microsoft.Web/sites/acs-bot-node",
+    "appService.deploySubpath": "."
+}
