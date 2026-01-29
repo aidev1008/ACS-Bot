@@ -1,10 +1,12 @@
 
+
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
+const fetch = require('node-fetch');
 
-const SUPABASE_URL = "https://gxhyqxremqavfjozvrbk.supabase.co";
-const SUPABASE_SERVICE_ROLE_KEY ="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd4aHlxeHJlbXFhdmZqb3p2cmJrIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MjA5MDg5NywiZXhwIjoyMDc3NjY2ODk3fQ.BjqmOqw3VvLh3ObuKZ-cA78m9m5_YOYwzFQK3Tn-BLk";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const PORT = process.env.PORT || 3000;
 
 const app = express();
