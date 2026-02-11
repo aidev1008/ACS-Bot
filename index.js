@@ -14,59 +14,34 @@ const AZURE_OPENAI_DEPLOYMENT =
   process.env.AZURE_OPENAI_DEPLOYMENT || "gpt-realtime";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const TENANT_ID = process.env.TENANT_ID;
+
+// ==============================================
+// ENVIRONMENT VALIDATION
+// ==============================================
+if (!TENANT_ID) {
+  console.warn("[STARTUP] ⚠️ TENANT_ID not set - using default tenant behavior");
+}
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  console.error("[FATAL] ❌ SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required.");
+  process.exit(1);
+}
+
+if (!AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_API_KEY) {
+  console.error("[FATAL] ❌ AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY are required.");
+  process.exit(1);
+}
+
+console.log("[STARTUP] ✅ Environment validated");
+if (TENANT_ID) {
+  console.log("[STARTUP] TENANT_ID:", TENANT_ID);
+}
 
 // ==============================================
 // ACTIVE SESSIONS MAP - Required for context injection
 // ==============================================
 const activeSessions = new Map();
-
-// ==============================================
-// FIELD NAME NORMALIZATION - Ensures consistent field tracking
-// ==============================================
-const FIELD_NAME_MAP = {
-  'name': 'Full Name',
-  'full_name': 'Full Name',
-  'customer_name': 'Full Name',
-  'investment_goal': 'Investment Goal',
-  'goal': 'Investment Goal',
-  'time_horizon': 'Time Horizon',
-  'horizon': 'Time Horizon',
-  'risk_appetite': 'Risk Appetite',
-  'risk': 'Risk Appetite',
-  'contribution_amount': 'Contribution Amount',
-  'amount': 'Contribution Amount',
-  'contribution_preference': 'Contribution Preference',
-  'preference': 'Contribution Preference',
-  'sa_id_number': 'SA ID Number',
-  'id_number': 'SA ID Number',
-  'id': 'SA ID Number',
-};
-
-function normalizeFieldName(fieldName) {
-  if (!fieldName) return fieldName;
-  const key = fieldName.toLowerCase().replace(/\s+/g, '_');
-  return FIELD_NAME_MAP[key] || fieldName;
-}
-
-function normalizeFieldValues(values) {
-  const normalized = {};
-  for (const [key, value] of Object.entries(values)) {
-    const normalizedKey = normalizeFieldName(key);
-    // Prefer existing value if already set (don't overwrite with duplicate)
-    if (!normalized[normalizedKey]) {
-      normalized[normalizedKey] = value;
-    }
-  }
-  return normalized;
-}
-
-function normalizeFieldList(fields) {
-  const normalized = new Set();
-  for (const field of fields) {
-    normalized.add(normalizeFieldName(field));
-  }
-  return Array.from(normalized);
-}
 
 // ==============================================
 // FORMAT CONTEXT MESSAGE - Optimized for GPT Realtime
@@ -251,12 +226,11 @@ app.post("/inject-context", async (req, res) => {
     const itemId = `ctx_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
     // ✅ ACCUMULATE fields FIRST (before formatting message)
-    // Normalize incoming field names for consistent tracking
+    // Trust incoming field names as canonical (no normalization needed)
     const incomingValues = context_delta?.cf || {};
-    const normalizedIncomingValues = normalizeFieldValues(incomingValues);
-    const newCollected = Object.keys(normalizedIncomingValues);
-    const newSkip = normalizeFieldList(context_delta?.skip || []);
-    const newMissing = normalizeFieldList(context_delta?.mf || []);
+    const newCollected = Object.keys(incomingValues);
+    const newSkip = context_delta?.skip || [];
+    const newMissing = context_delta?.mf || [];
 
     // Log BEFORE state (for debugging Agent UI issues)
     const beforeCount = Object.keys(session.callState.collectedValues).length;
@@ -267,30 +241,30 @@ app.post("/inject-context", async (req, res) => {
       Object.keys(session.callState.collectedValues),
     );
     console.log(
-      "[INJECT] INCOMING new (normalized): ",
+      "[INJECT] INCOMING new: ",
       newCollected.length,
       "fields:",
       newCollected,
     );
 
-    // Merge collected fields (deduplicated, normalized)
+    // Merge collected fields (deduplicated)
     session.callState.collectedFields = [
       ...new Set([
-        ...normalizeFieldList(session.callState.collectedFields),
+        ...session.callState.collectedFields,
         ...newCollected
       ]),
     ];
 
-    // Store collected VALUES (merge, don't overwrite, normalized keys)
+    // Store collected VALUES (merge, don't overwrite)
     session.callState.collectedValues = {
       ...session.callState.collectedValues,
-      ...normalizedIncomingValues,
+      ...incomingValues,
     };
 
-    // Merge skip fields (deduplicated, normalized)
+    // Merge skip fields (deduplicated)
     session.callState.skipFields = [
       ...new Set([
-        ...normalizeFieldList(session.callState.skipFields),
+        ...session.callState.skipFields,
         ...newSkip
       ]),
     ];
@@ -456,99 +430,59 @@ class SessionHandler {
     // ✅ Wait for actual customer speech before responding
     this.customerHasSpoken = false; // Has customer actually said something?
     this.lastTranscriptTime = null; // When did we last get a transcript?
+    
+    // ✅ DB-driven prompts (fetched at session start)
+    this.systemPrompt = null;
+    this.initialContextMessage = null;
+    
+    // ✅ FIX: Buffer audio until session.update is confirmed
+    this.configApplied = false;
+    this.audioBuffer = [];
   }
 
-  // ✅ Field name aliases - ensures both variations are checked
-  static FIELD_ALIASES = {
-    'name': ['full name', 'customer name', 'full_name'],
-    'full name': ['name', 'customer name', 'full_name'],
-    'full_name': ['name', 'full name', 'customer name'],
-    'investment goal': ['investment_goal', 'goal'],
-    'investment_goal': ['investment goal', 'goal'],
-    'time horizon': ['time_horizon', 'horizon', 'term'],
-    'time_horizon': ['time horizon', 'horizon', 'term'],
-    'risk appetite': ['risk_appetite', 'risk', 'appetite'],
-    'risk_appetite': ['risk appetite', 'risk', 'appetite'],
-    'contribution amount': ['contribution_amount', 'amount'],
-    'contribution_amount': ['contribution amount', 'amount'],
-    'contribution preference': ['contribution_preference', 'preference', 'debit order', 'lump sum'],
-    'contribution_preference': ['contribution preference', 'preference'],
-    'sa id number': ['sa_id_number', 'id number', 'id', 'identity'],
-    'sa_id_number': ['sa id number', 'id number', 'id'],
-  };
-
-  // ✅ Get all variations of a field name for comprehensive checking
-  getFieldVariations(field) {
-    const fieldLower = field.toLowerCase();
-    const variations = new Set([fieldLower, fieldLower.replace(/_/g, ' '), fieldLower.replace(/\s+/g, '_')]);
-    
-    // Add aliases
-    const aliases = SessionHandler.FIELD_ALIASES[fieldLower];
-    if (aliases) {
-      aliases.forEach(alias => variations.add(alias.toLowerCase()));
-    }
-    
-    return Array.from(variations);
-  }
-
-  // ✅ DEBUG: Check if AI violated context rules (asked about collected field)
-  checkContextViolation(responseText) {
-    const collectedKeys = Object.keys(this.callState.collectedValues);
-    const skipFields = this.callState.skipFields || [];
-    
-    // Combine collected and skip fields for comprehensive checking
-    const allProtectedFields = [...new Set([...collectedKeys, ...skipFields])];
-    if (allProtectedFields.length === 0) return null;
-
-    const responseLower = responseText.toLowerCase();
-    const violations = [];
-
-    // Common question patterns
-    const questionPatterns = [
-      "what is your",
-      "what's your",
-      "may i have your",
-      "can you provide",
-      "could you tell me",
-      "please provide",
-      "confirm your",
-      "share your",
-      "could i get your",
-      "can i have your",
-      "tell me your",
-    ];
-
-    allProtectedFields.forEach((field) => {
-      // Get all variations of this field name
-      const variations = this.getFieldVariations(field);
+  // ✅ Fetch prompts from database at session startup
+  async fetchPrompts() {
+    try {
+      console.log("[PROMPTS] Fetching session prompts from database...");
       
-      variations.forEach(variation => {
-        const fieldWords = variation.split(/[\s_]+/);
-        
-        // Check if response asks about this field
-        questionPatterns.forEach((pattern) => {
-          if (responseLower.includes(pattern)) {
-            fieldWords.forEach((word) => {
-              if (word.length > 2 && responseLower.includes(word)) {
-                violations.push({ field, variation, pattern, word });
-              }
-            });
-          }
-        });
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/get-session-prompts`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+        body: JSON.stringify({ tenant_id: TENANT_ID }),
       });
-    });
 
-    // Deduplicate violations by field
-    const uniqueViolations = [];
-    const seenFields = new Set();
-    violations.forEach(v => {
-      if (!seenFields.has(v.field)) {
-        seenFields.add(v.field);
-        uniqueViolations.push(v);
+      if (!response.ok) {
+        const errorBody = await response.text();
+        console.error("[PROMPTS] ❌ Failed to fetch prompts:", response.status, errorBody);
+        // Use minimal fallback prompts and defaults
+        this.systemPrompt = "You are a helpful call center assistant. Listen to the customer and provide appropriate guidance to the agent.";
+        this.initialContextMessage = "Please wait while context loads. Use generic welcoming responses until you receive a context update.";
+        this.maxResponseTokens = 60;
+        this.promptTemperature = 0.5;
+        return;
       }
-    });
 
-    return uniqueViolations.length > 0 ? uniqueViolations : null;
+      const data = await response.json();
+      this.systemPrompt = data.system_prompt || "You are a helpful call center assistant.";
+      this.initialContextMessage = data.initial_context_message || "Please wait while context loads.";
+      this.maxResponseTokens = data.max_response_tokens || 60;
+      this.promptTemperature = data.temperature || 0.5;
+      
+      console.log("[PROMPTS] ✅ Session prompts loaded from database");
+      console.log("[PROMPTS] System prompt length:", this.systemPrompt.length, "chars");
+      console.log("[PROMPTS] Max response tokens:", this.maxResponseTokens);
+      console.log("[PROMPTS] Temperature:", this.promptTemperature);
+    } catch (err) {
+      console.error("[PROMPTS] ❌ Error fetching prompts:", err.message);
+      // Use minimal fallback prompts and defaults
+      this.systemPrompt = "You are a helpful call center assistant. Listen to the customer and provide appropriate guidance to the agent.";
+      this.initialContextMessage = "Please wait while context loads. Use generic welcoming responses until you receive a context update.";
+      this.maxResponseTokens = 60;
+      this.promptTemperature = 0.5;
+    }
   }
 
   // ✅ CENTRALIZED LOGGER: Tracks everything sent to Azure OpenAI Realtime
@@ -665,21 +599,38 @@ class SessionHandler {
       if (this.keepaliveInterval) clearInterval(this.keepaliveInterval);
     });
   }
-  handleAzureMessage(msg) {
+   async handleAzureMessage(msg) {
     switch (msg.type) {
       case "session.created":
         console.log("[AZURE] ✅ session.created received");
-        // ✅ FIX: Increased delay from 1000ms to 2500ms to allow context injection to arrive first
-        console.log(
-          "[AZURE] ⏳ Waiting 2500ms before sending config (allow context injection to arrive)...",
-        );
-        setTimeout(() => {
-          this.sendConfig();
-        }, 2500);
+        // ✅ FIX: Fetch prompts from DB, then send config IMMEDIATELY (no delay)
+        console.log("[AZURE] ⏳ Fetching prompts then sending config immediately...");
+        this.fetchPrompts()
+          .catch(err => {
+            console.error("[PROMPTS] Failed, using fallback:", err.message);
+          })
+          .finally(() => {
+            this.sendConfig();
+          });
         break;
 
       case "session.updated":
         console.log("[AZURE] ✅ session.updated - Configuration applied");
+        // ✅ FIX: Now safe to process audio - flush buffered chunks
+        this.configApplied = true;
+        if (this.audioBuffer.length > 0) {
+          console.log(`[AZURE] 📤 Flushing ${this.audioBuffer.length} buffered audio chunks`);
+          this.audioBuffer.forEach(audioData => {
+            this.sendToAzure(
+              { type: "input_audio_buffer.append", audio: audioData },
+              "Buffered audio chunk"
+            );
+          });
+          this.audioBuffer = [];
+        }
+        
+        // ✅ FIX: Send initial context ONLY after session.updated is confirmed
+        this.sendInitialContext();
         break;
 
       case "conversation.item.created":
@@ -696,37 +647,57 @@ class SessionHandler {
         }
         break;
 
-      case "conversation.item.input_audio_transcription.completed":
-        this.transcriptsReceived++;
-        this.customerHasSpoken = true; // ✅ NEW: Mark that customer has spoken
-        this.lastTranscriptTime = Date.now();
-        console.log(
-          "[AZURE] 📝 TRANSCRIPTION COMPLETED #" + this.transcriptsReceived,
-        );
-        console.log("[AZURE] Transcript:", msg.transcript);
+        case "conversation.item.input_audio_transcription.completed":
+          this.transcriptsReceived++;
+          this.customerHasSpoken = true;
+          this.lastTranscriptTime = Date.now();
 
-        if (msg.transcript && msg.transcript.trim()) {
-          const customerText = msg.transcript.trim();
+          console.log("[AZURE] 📝 TRANSCRIPTION COMPLETED #" + this.transcriptsReceived);
+          console.log("[AZURE] Transcript:", msg.transcript);
 
-          // ✅ Store in full history (never truncated)
-          this.fullConversationHistory.push({
-            role: "customer",
-            text: customerText,
-            timestamp: new Date().toISOString(),
-            itemId: msg.item_id,
-          });
-          console.log(
-            "[HISTORY] 📚 Total exchanges:",
-            this.fullConversationHistory.length,
-          );
+          if (msg.transcript && msg.transcript.trim()) {
+            const customerText = msg.transcript.trim();
 
-          this.sendToSupabase("customer", customerText)
-            .then(() => console.log("[SUPABASE] ✅ Customer transcript sent"))
-            .catch((err) =>
-              console.error("[SUPABASE] ❌ Failed to send:", err.message),
-            );
-        }
-        break;
+            // Store full history
+            this.fullConversationHistory.push({
+              role: "customer",
+              text: customerText,
+              timestamp: new Date().toISOString(),
+              itemId: msg.item_id,
+            });
+
+            // Persist transcript (non-blocking)
+            this.sendToSupabase("customer", customerText)
+              .catch(err => console.error("[SUPABASE] ❌ Failed:", err.message));
+
+            // ✅ Build last 3–5 turns for semantic extraction
+            const lastFewTurns = this.fullConversationHistory
+              .slice(-5)
+              .map(({ role, text }) => ({ role, text }));
+
+            // ✅ CRITICAL: synchronous gate
+            const fastContextResponse = await fetch(`${SUPABASE_URL}/functions/v1/fast-context-inject`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`
+              },
+              body: JSON.stringify({
+                transcript: customerText,
+                conversation_history: lastFewTurns,
+                media_streaming_id: this.serverCallId,
+                tenant_id: TENANT_ID,
+              }),
+            });
+
+            if (!fastContextResponse.ok) {
+              const errorBody = await fastContextResponse.text();
+              console.error("[FAST-CONTEXT] ❌ Extraction failed:", fastContextResponse.status, errorBody);
+            } else {
+              console.log("[FAST-CONTEXT] ✅ Extraction + context injection completed");
+            }
+          }
+          break;
 
       case "response.text.delta":
         if (msg.delta) {
@@ -861,25 +832,6 @@ class SessionHandler {
             "[DEBUG] ⚠️ TOO MANY CONTEXT ITEMS - may confuse the model!",
           );
         }
-
-        // ✅ DEBUG: Check for context violations
-        console.log("[DEBUG] 🔍 CONTEXT VIOLATION CHECK:");
-        console.log(
-          "[DEBUG] Collected fields:",
-          Object.keys(this.callState.collectedValues),
-        );
-
-        const violations = this.checkContextViolation(this.currentResponseText);
-        if (violations) {
-          console.log("[DEBUG] ❌ POTENTIAL VIOLATION DETECTED!");
-          violations.forEach((v) => {
-            console.log(
-              `[DEBUG] ❌ AI may have asked about "${v.field}" (matched: "${v.word}" in "${v.pattern}")`,
-            );
-          });
-        } else {
-          console.log("[DEBUG] ✅ No obvious violations detected");
-        }
         console.log("[DEBUG] ========================================");
 
         // Reset timing tracker
@@ -905,6 +857,15 @@ class SessionHandler {
         this.currentResponseText = "";
         this.truncateConversationHistory();
         break;
+
+      default:
+        // ✅ FIX: Surface Azure errors and unhandled message types
+        if (msg.type === "error") {
+          console.error("[AZURE] ❌ ERROR from Azure OpenAI:", JSON.stringify(msg));
+        } else if (msg.type && !msg.type.startsWith("input_audio_buffer")) {
+          console.log("[AZURE] 📨 Unhandled message type:", msg.type);
+        }
+        break;
     }
   }
 
@@ -915,24 +876,39 @@ class SessionHandler {
       type: "session.update",
       session: {
         modalities: ["text"],
-        instructions: this.getSystemPrompt(),
+        instructions: this.systemPrompt,
         input_audio_format: "pcm16",
         input_audio_transcription: { model: "whisper-1" },
         turn_detection: {
           type: "server_vad",
           threshold: 0.5,
           prefix_padding_ms: 300,
-          silence_duration_ms: 800, // ✅ INCREASED from 500ms to reduce turn fragmentation
+          silence_duration_ms: 800,
         },
-        temperature: 0.7,
-        max_response_output_tokens: 150,
+        temperature: this.promptTemperature >= 0.6 ? this.promptTemperature : 0.6,
+        max_response_output_tokens: this.maxResponseTokens || 60,
       },
     };
 
-    this.sendToAzure(config, "Session configuration");
+    console.log("[AZURE] Using DB config - temperature:", config.session.temperature, "max_tokens:", config.session.max_response_output_tokens);
 
-    // ✅ FIX: Send initial context guidance - prevents asking for fields before context arrives
+    // ✅ FIX: Send ONLY session.update - no other messages until session.updated is received
+    this.sendToAzure(config, "Session configuration");
+  }
+
+  // ✅ FIX: Initial context sent ONLY after session.updated confirms config
+  sendInitialContext() {
     const initialContextId = `ctx_init_${Date.now()}`;
+    const initialContextText = this.initialContextMessage || `⏳ CONTEXT LOADING:
+The agent's CRM form is currently loading customer data. You will receive a context update shortly with the exact fields already collected.
+
+UNTIL YOU RECEIVE THAT UPDATE:
+- Use only generic, welcoming responses
+- Do not ask for specific information yet
+- Simply acknowledge the customer and let them know you're ready to help
+
+WAIT for the context update before asking any specific questions.`;
+    
     const initialContext = {
       type: "conversation.item.create",
       item: {
@@ -942,17 +918,7 @@ class SessionHandler {
         content: [
           {
             type: "input_text",
-            text: `⏳ CONTEXT LOADING - IMPORTANT INSTRUCTIONS:
-            The agent's CRM form is currently loading customer data. You will receive a "⚠️ MANDATORY CONTEXT UPDATE" message shortly with the EXACT fields already collected.
-
-            UNTIL YOU RECEIVE THAT UPDATE:
-            1. Use ONLY generic, welcoming responses
-            2. DO NOT ask for specific information like name, ID, investment goals, etc.
-            3. Simply acknowledge the customer and let them know you're ready to help
-            4. Example: "Thank you for calling STANLIB, I'm here to assist you."
-
-            WAIT for the context update before asking any specific questions.
-            The context update will tell you EXACTLY which fields are already collected and which are still needed.`,
+            text: initialContextText,
           },
         ],
       },
@@ -968,207 +934,45 @@ class SessionHandler {
     );
   }
 
+  // DEPRECATED: Fallback only - prompts are fetched from DB via fetchPrompts()
   getSystemPrompt() {
-    return `You are whispering suggestions into a call center agent’s ear during a live STANLIB call.
+    return `🚨 CRITICAL LANGUAGE RULE - HIGHEST PRIORITY 🚨
+YOU MUST ALWAYS RESPOND IN ENGLISH ONLY.
+You are whispering suggestions into a call center agent's ear during a live call.
 
-Your role is to guide the agent through the COMPLETE STANLIB INVESTMENT SALES PROCESS while the call is ongoing.
+OUTPUT RULES:
+- Output ONLY what the agent should SAY to the customer
+- ONE short sentence maximum
+- Ask for EXACTLY ONE piece of information at a time
+- Use simple, direct language
 
-========================
-STRICT OUTPUT RULES
-========================
-- Output ONLY what the agent should SAY next
-- Default: ONE sentence maximum
-- Exception: When listing documents, requirements, or steps → include ALL required items in natural speech
-- NO analysis
-- NO explanations
-- NO labels
-- NO brackets
-- English only
-- Write exactly as the agent should speak to the customer
-- Never mention internal processes, AI, policies, or documents
+CONTEXT INJECTION RULES (HIGHEST PRIORITY):
+You will receive system messages with "MANDATORY CONTEXT UPDATE".
+These are ALWAYS more authoritative than your training data.
 
-================================================================
-🚨 CRITICAL: CONTEXT INJECTION RULES (HIGHEST PRIORITY)
-================================================================
-You will receive system messages marked with "⚠️ MANDATORY CONTEXT UPDATE".
-These messages contain REAL-TIME information about what the agent has ALREADY collected.
+- ALREADY COLLECTED = NEVER ask again
+- STILL NEEDED = Ask for the FIRST item only
+- NEXT = This is the EXACT field to ask about NOW
 
-ABSOLUTE RULES - VIOLATION IS FORBIDDEN:
-1. ✅ ALREADY COLLECTED = NEVER ask for these fields again, even if your training says to
-2. 🚫 SKIP ENTIRELY = Customer declined or field not applicable - NEVER mention these
-3. ❓ STILL NEEDED = Ask for ONE of these fields ONLY
-4. 🟢 STATUS: COMPLETE = Stop asking questions, summarize and close
+QUESTION FORMAT:
+When STILL NEEDED has fields, ask a SHORT DIRECT question for NEXT.
 
-EXAMPLE:
-If you see "✅ ALREADY COLLECTED: Name: Jasmine, Risk Appetite: Low"
-You must NEVER say "What is your name?" or "What is your risk appetite?"
-Instead, ask for something from STILL NEEDED or move to the next step.
+GOOD examples:
+  NEXT: Full Name       -> "May I have your full name please?"
+  NEXT: SA ID Number    -> "Could you please provide your 5-digit ID number?"
+  NEXT: Investment Goal -> "What is the main goal for your investment?"
+  NEXT: Time Horizon    -> "How long are you looking to invest for?"
+  NEXT: Risk Appetite   -> "Would you describe your risk appetite as low, medium, or high?"
 
-WHY THIS MATTERS:
-The human agent has ALREADY collected this information in their CRM form.
-Repeating questions wastes time and frustrates the customer.
-Trust the context injection - it is ALWAYS more current than the conversation history.
+BAD examples (NEVER do this):
+  "Tell me a bit about yourself and what you're looking to achieve with this investment."
+  "I'd like to understand your full financial picture including your goals, timeline, and risk tolerance."
 
-========================
-CALL-CENTER SALES FLOW (MANDATORY)
-========================
-
-⭐ THE COMPLETE CALL-CENTER SALES PROCESS FOR A STANLIB INVESTMENT PRODUCT
-
-🔵 1. Call Opening & Identity Verification
-Goal: Build trust, confirm the caller’s details.
-
-Agent must:
-- Greet warmly
-- Verify identity with POPIA-compliant questions
-- Understand the purpose of the call
-- Capture details in CRM
-
-Example phrasing:
-“Good day, welcome to STANLIB. You’re speaking to <Name>. May I confirm your ID number and full name for security purposes?”
-
-🔵 2. Needs Assessment (MOST IMPORTANT STEP)
-Goal: Understand the investor’s goals, time horizon, and risk profile.
-
-Agent must assess:
-- Investment goal (retirement, education, saving, wealth)
-- Time horizon (short, medium, long term)
-- Risk appetite (low, medium, high)
-- Contribution preference (monthly debit order or lump sum)
-- Amount
-- Tax number availability
-
-🔵 3. Product Match & Explanation
-Match products strictly as follows:
-
-- Retirement planning + tax benefit → STANLIB Retirement Annuity (RA)
-- Tax-free long-term growth → STANLIB Tax-Free Savings Account (TFSA)
-- High growth, long term, high risk → STANLIB Equity Fund
-- Moderate risk, diversification → STANLIB Balanced Fund
-- Income or low risk → STANLIB Income Fund or Money Market Fund
-- Post-retirement income → STANLIB Living Annuity
-
-Explain benefits clearly and simply.
-
-🔵 4. Compliance Disclosures (MANDATORY)
-Agent must clearly state when relevant:
-- “Returns are not guaranteed.”
-- “Past performance is not an indication of future returns.”
-- “You should consider your financial needs and objectives.”
-- “If you require personal financial advice, I can refer you to a licensed financial adviser.”
-
-Never promise returns.
-Never cross into personal financial advice.
-
-🔵 5. Cost & Minimum Requirements
-Explain when asked:
-- Minimum investment amounts
-- Fees or TER where relevant
-- Withdrawal or switching rules
-- TFSA contribution limits if applicable
-
-🔵 6. Confirm Commitment
-Agent must ask one closing question:
-- “Would you like me to help you start the investment now?”
-- “Are you comfortable proceeding today?”
-- “Would you prefer a monthly contribution or a lump sum?”
-
-🔵 7. Capture Customer Information (FICA & Application)
-Collect:
-- Full name
-- SA ID or Passport
-- Residential address
-- Tax number
-- Email and mobile
-- Occupation
-- Source of funds
-- Contribution amount and frequency
-- Bank details
-
-🔵 8. Documents Required (MUST BE COMPLETE)
-When documents are requested, list ALL items accurately:
-
-RA:
-- ID
-- Proof of address
-- Employer details
-- Tax number
-- RA application form
-- Beneficiary nomination form
-
-TFSA:
-- ID
-- Proof of address
-- Tax number
-- TFSA declaration
-- Bank statement
-- Debit order form
-
-Money Market / Income / Equity / Balanced:
-- ID or Passport
-- Proof of address
-- Bank confirmation
-- Application form
-- FATCA/CRS
-- Source of funds declaration
-- Tax number if available
-
-Living Annuity:
-- ID
-- Proof of address
-- Retirement benefit statement
-- Transfer form
-- Bank statement
-- Beneficiary details
-
-🔵 9. Application Completion
-Agent must:
-- Confirm documents
-- Explain processing time (24–48 hours where applicable)
-- Inform customer about confirmation communication
-
-🔵 10. Debit Order or Lump Sum Setup
-Confirm:
-- Debit order date
-- Contribution amount
-- Bank account details
-- Consent for debit mandate
-
-🔵 11. Sale Completion & Welcome Journey
-Agent must:
-- Confirm application completion
-- Explain next steps
-- Inform about investor portal access
-- Share support contact details
-
-========================
-OBJECTION HANDLING
-========================
-
-If customer says:
-“I don’t want to lose money.”
-→ Emphasize risk alignment, diversification, and suitability without promising returns.
-
-If customer says:
-“Isn’t this risky?”
-→ Explain long-term horizon and diversification calmly.
-
-========================
-IF AUDIO IS UNCLEAR
-========================
-Say:
-“Could you please repeat that?”
-OR ask ONE simple clarifying question.
-
-========================
-REMEMBER
-========================
-You are assisting the AGENT.
-You are NOT speaking directly to the customer.
-Output ONLY the words the agent should say next.`;
+When STATUS: COMPLETE, summarize and close. Do NOT ask more questions.
+`;
   }
 
-  truncateConversationHistory() {
+    truncateConversationHistory() {
     if (!this.azureWs || this.azureWs.readyState !== WebSocket.OPEN) return;
 
     const maxItems = 1000; // ✅ INCREASED from 6 to retain more conversation context
@@ -1308,16 +1112,27 @@ Output ONLY the words the agent should say next.`;
   }
 
   handleACSAudio(audioData) {
-    if (this.azureWs && this.azureWs.readyState === WebSocket.OPEN) {
-      // ✅ Stream audio immediately - response suppression handles the timing
-      this.sendToAzure(
-        {
-          type: "input_audio_buffer.append",
-          audio: audioData,
-        },
-        "ACS audio chunk",
-      );
+    if (!this.azureWs || this.azureWs.readyState !== WebSocket.OPEN) {
+      return;
     }
+
+    // ✅ FIX: Buffer audio until session.update is confirmed
+    if (!this.configApplied) {
+      this.audioBuffer.push(audioData);
+      if (this.audioBuffer.length % 100 === 0) {
+        console.log(`[AUDIO] 📦 Buffering audio chunks: ${this.audioBuffer.length} (waiting for config)`);
+      }
+      return;
+    }
+
+    // Config applied - send audio directly
+    this.sendToAzure(
+      {
+        type: "input_audio_buffer.append",
+        audio: audioData,
+      },
+      "ACS audio chunk",
+    );
   }
 
   cleanup() {
@@ -1341,14 +1156,17 @@ wss.on("connection", (ws) => {
     if (data.kind === "AudioMetadata") {
       // Use subscriptionId (media_streaming_id) as the session key
       const subscriptionId = data.audioMetadata.subscriptionId;
-      const serverCallId = data.audioMetadata.serverCallId;
+      const rawServerCallId = data.audioMetadata.serverCallId;
 
       // Prefer subscriptionId for channel alignment with Agent UI
-      const sessionKey = subscriptionId || serverCallId;
+      const sessionKey = subscriptionId || rawServerCallId;
+      
+      // ✅ FIX: Assign to outer variable so ws.on("close") can access it
+      serverCallId = sessionKey;
 
       console.log("[ACS] AudioMetadata received");
       console.log("[ACS] subscriptionId (media_streaming_id):", subscriptionId);
-      console.log("[ACS] serverCallId:", serverCallId);
+      console.log("[ACS] serverCallId:", rawServerCallId);
       console.log("[ACS] Using session key:", sessionKey);
 
       session = new SessionHandler(ws, sessionKey);
